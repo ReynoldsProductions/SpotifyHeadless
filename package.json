@@ -8,19 +8,20 @@
   },
   "scripts": {
     "start": "node server.js",
-    "auth": "node auth-helper.js"
+    "auth": "node auth-helper.js",
+    "test": "node --test",
+    "smoke:real": "node scripts/smoke-real.js"
   },
-  "keywords": [
-    "spotify",
-    "companion",
-    "socket.io",
-    "bitfocus"
-  ],
+  "keywords": ["spotify", "companion", "socket.io", "bitfocus"],
   "author": "",
   "license": "MIT",
   "dependencies": {
     "dotenv": "^16.3.1",
     "express": "^4.18.2",
     "socket.io": "^4.7.2"
+  },
+  "devDependencies": {
+    "socket.io-client": "^4.7.2",
+    "supertest": "^6.3.4"
   }
 }
