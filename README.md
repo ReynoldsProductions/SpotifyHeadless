@@ -41,6 +41,27 @@ The server listens on `http://0.0.0.0:8801` (HTTP + Socket.io). Configure Compan
 
 A simple “now playing” UI is available at **http://localhost:8801/ui** (or **/ui.html**). It shows track title, artist, album, album art, progress bar, connection status, and device name, and updates live via Socket.io.
 
+## Programmatic API
+
+The server is created via `createServer()`; it does **not** call `server.listen()` when the module is required.
+
+```js
+const { createServer } = require('./server.js');
+
+const { app, server, io, start, stop } = createServer({ spotifyClientOverride: null });
+
+await start(8801);   // optional port, defaults to PORT env or 8801
+// ...
+await stop();        // stops polling, ramp timer, and closes the HTTP server
+```
+
+- **createServer({ spotifyClientOverride })**  
+  Returns `{ app, server, io, start, stop }`. If `spotifyClientOverride` is provided, it is used instead of building a `SpotifyWebAPI` from env (useful for tests or custom clients).
+- **start(port)**  
+  Starts polling, optional device transfer, and listens on `port`. Returns a Promise that resolves when listening (or rejects on listen error).
+- **stop()**  
+  Stops the poll interval, clears any volume-ramp timer, and closes the HTTP server. Returns a Promise that resolves when the server is closed.
+
 ## Environment Variables
 
 | Variable | Default | Description |
@@ -90,6 +111,25 @@ A simple “now playing” UI is available at **http://localhost:8801/ui** (or *
 
 - **playbackInfo**: `{ name, artist, album, duration (ms), playbackPosition (seconds), trackId (spotify:track:...), playerState ('Playing'|'Paused'|'Stopped'), albumArtUrl, deviceName, deviceIsActive }`
 - **state**: `{ track_id, volume (0–100), position (seconds), state ('playing'|'paused'|'stopped'), isRepeating, isShuffling }`
+
+## Testing
+
+- **Unit/integration tests** (Node built-in test runner):
+
+  ```bash
+  npm test
+  ```
+
+  - **test/fake-spotify.js** – Fake Spotify client implementing `getPlaybackState`, `play`, `pause`, `next`, `previous`, `seek`, `setVolume`, `setRepeat`, `setShuffle`, `getDevices`, `transferPlayback` for use in tests.
+  - **test/http.test.js** – Uses [supertest](https://github.com/ladjs/supertest) to assert `/version`, `/control_status`, `/state` response shape, and `/playToggle` toggling playback.
+  - **test/socket.test.js** – Uses [socket.io-client](https://github.com/socketio/socket.io-client) to assert `version` and `control_status` on connect, and that emitting `playToggle` results in a `state_change` event.
+
+- **Smoke test (real bridge)** – Connects to a running bridge at `http://127.0.0.1:8801`, logs `state_change` events, and emits `state`, `playToggle`, `next`, `volumeDown`, `pause` in sequence. Exits 0 if at least one `state_change` was received and no socket errors; otherwise exits 1.
+
+  ```bash
+  npm start          # in one terminal
+  npm run smoke:real # in another
+  ```
 
 ## Repository
 
