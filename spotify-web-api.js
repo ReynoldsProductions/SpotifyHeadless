@@ -48,7 +48,7 @@ class SpotifyWebAPI {
     return this.accessToken;
   }
 
-  async _request (method, path, options = {}) {
+  async _request (method, path, options = {}, retried = false) {
     const token = await this._ensureToken();
     const url = path.startsWith('http') ? path : `${SPOTIFY_API_BASE}${path}`;
     const headers = {
@@ -65,11 +65,26 @@ class SpotifyWebAPI {
     });
     if (res.status === 204) return null;
     const text = await res.text();
+    if (!res.ok) {
+      let msg = `Spotify API ${res.status}`;
+      try {
+        const json = JSON.parse(text);
+        if (json.error && json.error.message) msg += ': ' + json.error.message;
+        else if (text) msg += ' ' + text;
+      } catch {
+        if (text) msg += ' ' + text;
+      }
+      if (res.status === 401 && !retried) {
+        this.accessToken = null;
+        return this._request(method, path, options, true);
+      }
+      throw new Error(msg);
+    }
     if (!text) return null;
     try {
       return JSON.parse(text);
     } catch {
-      throw new Error(`Spotify API error: ${res.status} ${text}`);
+      throw new Error(`Spotify API invalid JSON (${res.status}): ${text.slice(0, 200)}`);
     }
   }
 

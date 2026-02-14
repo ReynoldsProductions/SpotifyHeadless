@@ -29,6 +29,7 @@ let pollTimer = null;
 let lastStatePayload = null;
 let rampingState = false;
 let rampIntervalId = null;
+let lastNonZeroVolume = 50;
 
 function mapSpotifyToPlaybackInfo (player) {
   if (!player || !player.item) {
@@ -125,6 +126,9 @@ async function pollPlaybackState () {
   try {
     const player = await spotify.getPlaybackState();
     const payload = buildStateChangePayload(player);
+    if (payload.state && payload.state.volume > 0) {
+      lastNonZeroVolume = payload.state.volume;
+    }
     if (!payloadEquals(payload, lastStatePayload)) {
       broadcastStateChange(payload);
     }
@@ -158,8 +162,12 @@ async function ensureDeviceAndTransfer () {
     if (!target && deviceName) {
       target = devices.find(d => (d.name || '').toLowerCase() === String(deviceName).toLowerCase());
     }
-    if (target && SPOTIFY_AUTO_TRANSFER_ON_START) {
-      await spotify.transferPlayback(target.id, false);
+    if (target) {
+      spotify.deviceId = target.id;
+      console.log('Using device: ' + (target.name || 'Unknown') + ' (' + target.id + ')');
+      if (SPOTIFY_AUTO_TRANSFER_ON_START) {
+        await spotify.transferPlayback(target.id, false);
+      }
     }
   } catch (e) {
     console.error('Transfer on start:', e.message);
@@ -188,20 +196,21 @@ function rampVolume (targetVolume, changePercent, rampTimeSeconds, done) {
     clearInterval(rampIntervalId);
     rampIntervalId = null;
   }
-  rampingState = true;
-  io.emit('ramping_state', true);
-  let currentPayload = lastStatePayload;
+  const currentPayload = lastStatePayload;
   const startVolume = (currentPayload && currentPayload.state && currentPayload.state.volume != null) ? currentPayload.state.volume : 0;
   const target = Math.max(0, Math.min(100, Math.round(Number(targetVolume) || 0)));
-  const steps = Math.max(1, Math.round((rampTimeSeconds || 1) * 10));
-  const stepMs = (rampTimeSeconds * 1000) / steps;
-  const delta = (target - startVolume) / steps;
+  const changePerStep = Math.max(1, Math.round(Number(changePercent) || 1));
+  const steps = Math.ceil(Math.abs(target - startVolume) / changePerStep) || 1;
+  const rampTimeMs = (Number(rampTimeSeconds) || 1) * 1000;
+  const stepDelayMs = Math.max(100, Math.floor(rampTimeMs / steps));
+
+  rampingState = true;
+  io.emit('ramping_state', true);
+
   let step = 0;
 
   const tick = async () => {
-    step++;
-    const v = Math.round(startVolume + delta * step);
-    const volume = Math.max(0, Math.min(100, step >= steps ? target : v));
+    const volume = Math.max(0, Math.min(100, Math.round(startVolume + (target - startVolume) * (step / steps))));
     if (spotify && ALLOW_CONTROL) {
       try {
         await spotify.setVolume(volume);
@@ -215,10 +224,12 @@ function rampVolume (targetVolume, changePercent, rampTimeSeconds, done) {
       io.emit('ramping_state', false);
       pollPlaybackState();
       if (typeof done === 'function') done();
+      return;
     }
+    step++;
   };
 
-  rampIntervalId = setInterval(tick, stepMs);
+  rampIntervalId = setInterval(tick, stepDelayMs);
   tick();
 }
 
@@ -301,6 +312,7 @@ app.get('/volumeUp', (req, res) => {
   if (!ALLOW_CONTROL || !spotify) {
     return res.status(ALLOW_CONTROL ? 503 : 403).send(ALLOW_CONTROL ? 'Spotify not configured' : 'Control disabled');
   }
+  if (rampingState) return res.status(409).send('Volume ramping in progress');
   const currentPayload = lastStatePayload;
   const v = (currentPayload && currentPayload.state && currentPayload.state.volume != null) ? currentPayload.state.volume : 50;
   restControl(req, res, () => spotify.setVolume(Math.min(100, v + 10)));
@@ -310,12 +322,14 @@ app.get('/volumeDown', (req, res) => {
   if (!ALLOW_CONTROL || !spotify) {
     return res.status(ALLOW_CONTROL ? 503 : 403).send(ALLOW_CONTROL ? 'Spotify not configured' : 'Control disabled');
   }
+  if (rampingState) return res.status(409).send('Volume ramping in progress');
   const currentPayload = lastStatePayload;
   const v = (currentPayload && currentPayload.state && currentPayload.state.volume != null) ? currentPayload.state.volume : 50;
   restControl(req, res, () => spotify.setVolume(Math.max(0, v - 10)));
 });
 
 app.get('/setVolume/:volume', (req, res) => {
+  if (rampingState) return res.status(409).send('Volume ramping in progress');
   const vol = Math.max(0, Math.min(100, Math.round(Number(req.params.volume) || 0)));
   restControl(req, res, () => spotify.setVolume(vol));
 });
@@ -331,14 +345,13 @@ app.get('/rampVolume/:volume/:changePercent/:rampTime', (req, res) => {
   res.send('OK');
 });
 
-app.get('/mute', (req, res) => restControl(req, res, () => spotify.setVolume(0)));
+app.get('/mute', (req, res) => {
+  if (rampingState) return res.status(409).send('Volume ramping in progress');
+  return restControl(req, res, () => spotify.setVolume(0));
+});
 app.get('/unmute', (req, res) => {
-  if (!ALLOW_CONTROL || !spotify) {
-    return res.status(ALLOW_CONTROL ? 503 : 403).send(ALLOW_CONTROL ? 'Spotify not configured' : 'Control disabled');
-  }
-  const currentPayload = lastStatePayload;
-  const v = (currentPayload && currentPayload.state && currentPayload.state.volume != null) ? currentPayload.state.volume : 50;
-  restControl(req, res, () => spotify.setVolume(v || 50));
+  if (rampingState) return res.status(409).send('Volume ramping in progress');
+  return restControl(req, res, () => spotify.setVolume(lastNonZeroVolume || 50));
 });
 app.get('/repeatOn', (req, res) => restControl(req, res, () => spotify.setRepeat('context')));
 app.get('/repeatOff', (req, res) => restControl(req, res, () => spotify.setRepeat('off')));
@@ -393,17 +406,17 @@ io.on('connection', (socket) => {
   });
 
   socket.on('volumeUp', () => {
-    if (!ALLOW_CONTROL || !spotify) return;
+    if (rampingState || !ALLOW_CONTROL || !spotify) return;
     const v = (lastStatePayload && lastStatePayload.state && lastStatePayload.state.volume != null) ? lastStatePayload.state.volume : 50;
     spotify.setVolume(Math.min(100, v + 10)).catch(e => console.error(e.message));
   });
   socket.on('volumeDown', () => {
-    if (!ALLOW_CONTROL || !spotify) return;
+    if (rampingState || !ALLOW_CONTROL || !spotify) return;
     const v = (lastStatePayload && lastStatePayload.state && lastStatePayload.state.volume != null) ? lastStatePayload.state.volume : 50;
     spotify.setVolume(Math.max(0, v - 10)).catch(e => console.error(e.message));
   });
   socket.on('setVolume', (volume0to100) => {
-    if (!ALLOW_CONTROL || !spotify) return;
+    if (rampingState || !ALLOW_CONTROL || !spotify) return;
     const v = Math.max(0, Math.min(100, Number(volume0to100) || 0));
     spotify.setVolume(v).catch(e => console.error(e.message));
   });
@@ -412,12 +425,8 @@ io.on('connection', (socket) => {
     rampVolume(targetVolume, changePercent, rampTimeSeconds);
   });
 
-  socket.on('mute', () => ALLOW_CONTROL && spotify && spotify.setVolume(0).catch(e => console.error(e.message)));
-  socket.on('unmute', () => {
-    if (!ALLOW_CONTROL || !spotify) return;
-    const v = (lastStatePayload && lastStatePayload.state && lastStatePayload.state.volume != null) ? lastStatePayload.state.volume : 50;
-    spotify.setVolume(v || 50).catch(e => console.error(e.message));
-  });
+  socket.on('mute', () => !rampingState && ALLOW_CONTROL && spotify && spotify.setVolume(0).catch(e => console.error(e.message)));
+  socket.on('unmute', () => !rampingState && ALLOW_CONTROL && spotify && spotify.setVolume(lastNonZeroVolume || 50).catch(e => console.error(e.message)));
   socket.on('repeatOn', () => ALLOW_CONTROL && spotify && spotify.setRepeat('context').catch(e => console.error(e.message)));
   socket.on('repeatOff', () => ALLOW_CONTROL && spotify && spotify.setRepeat('off').catch(e => console.error(e.message)));
   socket.on('shuffleOn', () => ALLOW_CONTROL && spotify && spotify.setShuffle(true).catch(e => console.error(e.message)));
